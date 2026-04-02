@@ -1,0 +1,205 @@
+package com.gachon.lst;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.media.Image;
+import android.media.ImageReader;
+import android.media.projection.MediaProjection;
+import android.media.projection.MediaProjectionManager;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.util.DisplayMetrics;
+import android.util.Log;
+
+import androidx.annotation.Nullable;
+import androidx.core.app.NotificationCompat;
+
+import com.google.mlkit.common.model.DownloadConditions;
+import com.google.mlkit.nl.translate.TranslateLanguage;
+import com.google.mlkit.nl.translate.Translation;
+import com.google.mlkit.nl.translate.Translator;
+import com.google.mlkit.nl.translate.TranslatorOptions;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions;
+
+import java.nio.ByteBuffer;
+
+public class ScreenCaptureService extends Service {
+
+    private static final String TAG = "ScreenCaptureService";
+    private static final String CHANNEL_ID = "ScreenCaptureChannel";
+
+    private MediaProjectionManager projectionManager;
+    private MediaProjection mediaProjection;
+    private VirtualDisplay virtualDisplay;
+    private ImageReader imageReader;
+
+    private TextRecognizer textRecognizer;
+    private Translator translator;
+
+    private HandlerThread backgroundThread;
+    private Handler backgroundHandler;
+
+    private long lastAnalyzedTimestamp = 0L;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+
+        // 1. ML Kit 텍스트 인식기 및 번역 엔진 초기화
+        textRecognizer = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
+
+        TranslatorOptions options = new TranslatorOptions.Builder()
+                .setSourceLanguage(TranslateLanguage.KOREAN) // 기본값(한->영)
+                .setTargetLanguage(TranslateLanguage.ENGLISH)
+                .build();
+        translator = Translation.getClient(options);
+
+        DownloadConditions conditions = new DownloadConditions.Builder().requireWifi().build();
+        translator.downloadModelIfNeeded(conditions);
+
+        // 2. 백그라운드 스레드 시작 (메인 화면이 버벅이지 않게 따로 일하는 일꾼)
+        backgroundThread = new HandlerThread("ScreenCaptureThread");
+        backgroundThread.start();
+        backgroundHandler = new Handler(backgroundThread.getLooper());
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        // 백그라운드 서비스를 위한 알림(Notification) 띄우기
+        createNotificationChannel();
+        Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("실시간 화면 번역기")
+                .setContentText("화면을 분석하고 있습니다...")
+                .setSmallIcon(R.mipmap.ic_launcher) // 가지고 계신 아이콘으로 변경 가능
+                .build();
+        startForeground(1, notification);
+
+        // MainActivity에서 넘겨준 화면 캡처 권한 데이터 받기
+        int resultCode = intent.getIntExtra("code", -1);
+        Intent resultData = intent.getParcelableExtra("data");
+
+        if (resultCode != -1 && resultData != null) {
+            projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData);
+            startScreenCapture();
+        }
+
+        return START_NOT_STICKY;
+    }
+
+    private void startScreenCapture() {
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        int width = metrics.widthPixels;
+        int height = metrics.heightPixels;
+        int density = metrics.densityDpi;
+
+        // ImageReader 설정: RGBA_8888 포맷으로 최대 2장의 이미지만 보관
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
+
+        virtualDisplay = mediaProjection.createVirtualDisplay("ScreenCapture",
+                width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader.getSurface(), null, backgroundHandler);
+
+        imageReader.setOnImageAvailableListener(reader -> {
+            Image image = null;
+            try {
+                image = reader.acquireLatestImage();
+                if (image != null) {
+                    long currentTime = System.currentTimeMillis();
+                    // 💡 1초에 2장(500ms)만 통과시키는 수문장 로직
+                    if (currentTime - lastAnalyzedTimestamp >= 500) {
+                        lastAnalyzedTimestamp = currentTime;
+                        processImage(image, width, height);
+                    } else {
+                        image.close(); // 시간 안 지났으면 버림 (발열 방지)
+                    }
+                }
+            } catch (Exception e) {
+                if (image != null) image.close();
+            }
+        }, backgroundHandler);
+    }
+
+    private void processImage(Image image, int width, int height) {
+        // ImageReader의 이미지를 Bitmap으로 변환
+        Image.Plane[] planes = image.getPlanes();
+        ByteBuffer buffer = planes[0].getBuffer();
+        int pixelStride = planes[0].getPixelStride();
+        int rowStride = planes[0].getRowStride();
+        int rowPadding = rowStride - pixelStride * width;
+
+        Bitmap bitmap = Bitmap.createBitmap(width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888);
+        bitmap.copyPixelsFromBuffer(buffer);
+        image.close(); // 이미지는 빨리 닫아줘야 메모리 누수가 없습니다.
+
+        // 패딩 잘라내기 (실제 화면 크기에 맞게)
+        Bitmap croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height);
+        InputImage inputImage = InputImage.fromBitmap(croppedBitmap, 0);
+
+        textRecognizer.process(inputImage)
+                .addOnSuccessListener(visionText -> {
+                    for (Text.TextBlock block : visionText.getTextBlocks()) {
+                        String text = block.getText();
+                        Rect boundingBox = block.getBoundingBox();
+                        if (boundingBox != null) {
+                            translateText(text, boundingBox);
+                        }
+                    }
+                })
+                .addOnFailureListener(e -> Log.e(TAG, "텍스트 인식 실패", e));
+    }
+
+    private void translateText(String text, Rect boundingBox) {
+        translator.translate(text)
+                .addOnSuccessListener(translatedText -> {
+                    // 화면 UI에 그리는 대신 로그캣에만 출력합니다.
+                    Log.d(TAG, "✅ [원문] : " + text.replace("\n", " "));
+                    Log.d(TAG, "🎯 [번역] : " + translatedText.replace("\n", " "));
+                    Log.d(TAG, "--------------------------------------------------");
+                })
+                .addOnFailureListener(e -> Log.e(TAG, "번역 실패", e));
+    }
+
+    private void createNotificationChannel() {
+        // 안드로이드 버전이 8.0(API 26) 이상일 때만 알림 채널을 생성하도록 조건문 추가
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "Screen Capture Service", NotificationManager.IMPORTANCE_LOW);
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        if (virtualDisplay != null) virtualDisplay.release();
+        if (imageReader != null) imageReader.close();
+        if (mediaProjection != null) mediaProjection.stop();
+        if (textRecognizer != null) textRecognizer.close();
+        if (translator != null) translator.close();
+        if (backgroundThread != null) backgroundThread.quitSafely();
+    }
+
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}
