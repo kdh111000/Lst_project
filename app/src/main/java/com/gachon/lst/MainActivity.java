@@ -12,23 +12,27 @@ import android.widget.Toast;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
 
 public class MainActivity extends AppCompatActivity {
 
     private MediaProjectionManager projectionManager;
 
-    // 화면 캡처 권한을 요청하고 결과를 받아오는 런처
+    // 💡 최신 방식: 화면 캡처 권한을 요청하고 결과를 받아오는 런처
     private final ActivityResultLauncher<Intent> screenCaptureLauncher =
             registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
                 if (result.getResultCode() == RESULT_OK && result.getData() != null) {
-                    // 권한을 허락받았다면, 백그라운드 서비스(ScreenCaptureService)를 실행합니다!
+
+                    Toast.makeText(this, "번역기가 실행되었습니다. 앱을 내려도 동작합니다.", Toast.LENGTH_SHORT).show();
+
+                    // 권한을 허락받았다면, 백그라운드 서비스(ScreenCaptureService)를 실행!
                     Intent serviceIntent = new Intent(this, ScreenCaptureService.class);
                     serviceIntent.putExtra("code", result.getResultCode());
                     serviceIntent.putExtra("data", result.getData());
-// ✅ ContextCompat을 사용하면 안드로이드가 알아서 버전에 맞게 실행해 줍니다!
-                    androidx.core.content.ContextCompat.startForegroundService(this, serviceIntent);
 
-                    Toast.makeText(this, "번역기가 실행되었습니다. 앱을 내려도 동작합니다.", Toast.LENGTH_SHORT).show();
+                    // 안드로이드 버전에 맞게 포그라운드 서비스 실행
+                    ContextCompat.startForegroundService(this, serviceIntent);
+
                     // 앱 화면을 닫고 홈 화면으로 이동시킴
                     moveTaskToBack(true);
                 } else {
@@ -39,14 +43,12 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main); // 아까 수정한 activity_main.xml 화면을 부릅니다.
+        setContentView(R.layout.activity_main);
 
         projectionManager = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         Button btnStart = findViewById(R.id.btn_start_translation);
 
-        btnStart.setOnClickListener(v -> {
-            checkPermissionsAndStart();
-        });
+        btnStart.setOnClickListener(v -> checkPermissionsAndStart());
     }
 
     private void checkPermissionsAndStart() {

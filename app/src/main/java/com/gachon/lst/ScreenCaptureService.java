@@ -57,20 +57,24 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        Log.d(TAG, "🚀 서비스 onCreate() 호출됨");
 
         // 1. ML Kit 텍스트 인식기 및 번역 엔진 초기화
         textRecognizer = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
 
         TranslatorOptions options = new TranslatorOptions.Builder()
-                .setSourceLanguage(TranslateLanguage.KOREAN) // 기본값(한->영)
+                .setSourceLanguage(TranslateLanguage.KOREAN)
                 .setTargetLanguage(TranslateLanguage.ENGLISH)
                 .build();
         translator = Translation.getClient(options);
 
+        // 번역 모델 다운로드 상태 확인용 로그 추가
         DownloadConditions conditions = new DownloadConditions.Builder().requireWifi().build();
-        translator.downloadModelIfNeeded(conditions);
+        translator.downloadModelIfNeeded(conditions)
+                .addOnSuccessListener(v -> Log.d(TAG, "✅ 한-영 번역 모델 다운로드 및 준비 완료!"))
+                .addOnFailureListener(e -> Log.e(TAG, "❌ 번역 모델 다운로드 실패", e));
 
-        // 2. 백그라운드 스레드 시작 (메인 화면이 버벅이지 않게 따로 일하는 일꾼)
+        // 2. 백그라운드 스레드 시작
         backgroundThread = new HandlerThread("ScreenCaptureThread");
         backgroundThread.start();
         backgroundHandler = new Handler(backgroundThread.getLooper());
@@ -78,23 +82,41 @@ public class ScreenCaptureService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // 백그라운드 서비스를 위한 알림(Notification) 띄우기
+        Log.d(TAG, "🚀 서비스 onStartCommand() 호출됨");
+
         createNotificationChannel();
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("실시간 화면 번역기")
                 .setContentText("화면을 분석하고 있습니다...")
-                .setSmallIcon(R.mipmap.ic_launcher) // 가지고 계신 아이콘으로 변경 가능
+                .setSmallIcon(R.mipmap.ic_launcher)
                 .build();
-        startForeground(1, notification);
 
-        // MainActivity에서 넘겨준 화면 캡처 권한 데이터 받기
-        int resultCode = intent.getIntExtra("code", -1);
-        Intent resultData = intent.getParcelableExtra("data");
+        // 안드로이드 14(API 34) 이상을 위한 호환성 코드
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(1, notification);
+        }
 
-        if (resultCode != -1 && resultData != null) {
+        // 💡 수정 1: 기본값을 -1이 아닌 0으로 변경합니다.
+        int resultCode = intent.getIntExtra("code", 0);
+
+        // 💡 수정 2: 안드로이드 13 이상을 위한 안전한 데이터 추출 방식 적용
+        Intent resultData;
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            resultData = intent.getParcelableExtra("data", Intent.class);
+        } else {
+            resultData = intent.getParcelableExtra("data");
+        }
+
+        // 💡 수정 3: resultCode가 Activity.RESULT_OK (즉, -1)인지 정확히 확인합니다.
+        if (resultCode == android.app.Activity.RESULT_OK && resultData != null) {
+            Log.d(TAG, "✅ 권한 데이터 수신 완료. 캡처를 시작합니다.");
             projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
             mediaProjection = projectionManager.getMediaProjection(resultCode, resultData);
             startScreenCapture();
+        } else {
+            Log.e(TAG, "❌ 권한 데이터를 제대로 받지 못했습니다! (수신된 code: " + resultCode + ")");
         }
 
         return START_NOT_STICKY;
