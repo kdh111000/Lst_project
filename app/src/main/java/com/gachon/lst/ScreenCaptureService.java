@@ -35,6 +35,9 @@ import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions;
 
 import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ScreenCaptureService extends Service {
 
@@ -53,6 +56,8 @@ public class ScreenCaptureService extends Service {
     private Handler backgroundHandler;
 
     private long lastAnalyzedTimestamp = 0L;
+    private final AtomicBoolean isProcessing = new AtomicBoolean(false);
+    private String lastRecognizedText = "";
 
     @Override
     public void onCreate() {
@@ -142,12 +147,13 @@ public class ScreenCaptureService extends Service {
                 image = reader.acquireLatestImage();
                 if (image != null) {
                     long currentTime = System.currentTimeMillis();
-                    // 💡 1초에 2장(500ms)만 통과시키는 수문장 로직
-                    if (currentTime - lastAnalyzedTimestamp >= 500) {
+                    // 💡 500ms 간격 + 이전 처리 완료 여부를 함께 확인
+                    if (currentTime - lastAnalyzedTimestamp >= 500
+                            && isProcessing.compareAndSet(false, true)) {
                         lastAnalyzedTimestamp = currentTime;
                         processImage(image, width, height);
                     } else {
-                        image.close(); // 시간 안 지났으면 버림 (발열 방지)
+                        image.close(); // 시간 안 지났거나 아직 처리 중이면 버림
                     }
                 }
             } catch (Exception e) {
@@ -174,26 +180,60 @@ public class ScreenCaptureService extends Service {
 
         textRecognizer.process(inputImage)
                 .addOnSuccessListener(visionText -> {
+                    // 전체 인식 텍스트를 합쳐서 이전 결과와 비교
+                    StringBuilder sb = new StringBuilder();
                     for (Text.TextBlock block : visionText.getTextBlocks()) {
+                        sb.append(block.getText().trim()).append("\n");
+                    }
+                    String currentText = sb.toString().trim();
+
+                    if (currentText.isEmpty() || currentText.equals(lastRecognizedText)) {
+                        // 텍스트가 없거나 이전과 동일하면 번역 스킵
+                        Log.d(TAG, "⏭️ 텍스트 변화 없음 — 번역 스킵");
+                        isProcessing.set(false);
+                        return;
+                    }
+
+                    lastRecognizedText = currentText;
+
+                    // 번역할 블록 수를 세어 모든 번역 완료 시 플래그 해제
+                    List<Text.TextBlock> blocks = visionText.getTextBlocks();
+                    AtomicInteger remaining = new AtomicInteger(blocks.size());
+
+                    for (Text.TextBlock block : blocks) {
                         String text = block.getText();
                         Rect boundingBox = block.getBoundingBox();
                         if (boundingBox != null) {
-                            translateText(text, boundingBox);
+                            translateText(text, boundingBox, remaining);
+                        } else {
+                            if (remaining.decrementAndGet() == 0) {
+                                isProcessing.set(false);
+                            }
                         }
                     }
                 })
-                .addOnFailureListener(e -> Log.e(TAG, "텍스트 인식 실패", e));
+                .addOnFailureListener(e -> {
+                    Log.e(TAG, "텍스트 인식 실패", e);
+                    isProcessing.set(false);
+                });
     }
 
-    private void translateText(String text, Rect boundingBox) {
+    private void translateText(String text, Rect boundingBox, AtomicInteger remaining) {
         translator.translate(text)
                 .addOnSuccessListener(translatedText -> {
-                    // 화면 UI에 그리는 대신 로그캣에만 출력합니다.
                     Log.d(TAG, "✅ [원문] : " + text.replace("\n", " "));
                     Log.d(TAG, "🎯 [번역] : " + translatedText.replace("\n", " "));
                     Log.d(TAG, "--------------------------------------------------");
+                    if (remaining.decrementAndGet() == 0) {
+                        isProcessing.set(false);
+                    }
                 })
-                .addOnFailureListener(e -> Log.e(TAG, "번역 실패", e));
+                .addOnFailureListener(e -> {
+                    Log.e(TAG, "번역 실패", e);
+                    if (remaining.decrementAndGet() == 0) {
+                        isProcessing.set(false);
+                    }
+                });
     }
 
     private void createNotificationChannel() {
