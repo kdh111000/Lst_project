@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.hardware.display.DisplayManager;
@@ -14,11 +15,18 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
+import android.widget.TextView;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
@@ -35,14 +43,19 @@ import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public class ScreenCaptureService extends Service {
 
     private static final String TAG = "ScreenCaptureService";
     private static final String CHANNEL_ID = "ScreenCaptureChannel";
+    private static final long CAPTURE_INTERVAL_MS = 500L;   // 1초에 2장
+    private static final long SUBTITLE_EXPIRY_MS = 1500L;  // 캡처 간격(500ms)의 3배 → 깜빡임 방지
+    private static final int SUBTITLE_HEIGHT_PX = 50;       // 자막 높이 추정값 (충분히 여유있게)
 
     private MediaProjectionManager projectionManager;
     private MediaProjection mediaProjection;
@@ -57,29 +70,26 @@ public class ScreenCaptureService extends Service {
 
     private long lastAnalyzedTimestamp = 0L;
     private final AtomicBoolean isProcessing = new AtomicBoolean(false);
-    private String lastRecognizedText = "";
+    private String targetLanguage = TranslateLanguage.ENGLISH;
+
+    private WindowManager windowManager;
+    private FrameLayout overlayContainer;
+    private Handler mainHandler;
+
+    private final ConcurrentHashMap<String, SubtitleItem> activeSubtitles = new ConcurrentHashMap<>();
+
+    private static class SubtitleItem {
+        TextView view;
+        long lastSeenTime;
+        Rect overlayRect; // 자막이 화면에서 차지하는 추정 영역 (자막 증식·겹침 방지용)
+    }
 
     @Override
     public void onCreate() {
         super.onCreate();
-        Log.d(TAG, "🚀 서비스 onCreate() 호출됨");
-
-        // 1. ML Kit 텍스트 인식기 및 번역 엔진 초기화
+        mainHandler = new Handler(Looper.getMainLooper());
         textRecognizer = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
 
-        TranslatorOptions options = new TranslatorOptions.Builder()
-                .setSourceLanguage(TranslateLanguage.KOREAN)
-                .setTargetLanguage(TranslateLanguage.ENGLISH)
-                .build();
-        translator = Translation.getClient(options);
-
-        // 번역 모델 다운로드 상태 확인용 로그 추가
-        DownloadConditions conditions = new DownloadConditions.Builder().requireWifi().build();
-        translator.downloadModelIfNeeded(conditions)
-                .addOnSuccessListener(v -> Log.d(TAG, "✅ 한-영 번역 모델 다운로드 및 준비 완료!"))
-                .addOnFailureListener(e -> Log.e(TAG, "❌ 번역 모델 다운로드 실패", e));
-
-        // 2. 백그라운드 스레드 시작
         backgroundThread = new HandlerThread("ScreenCaptureThread");
         backgroundThread.start();
         backgroundHandler = new Handler(backgroundThread.getLooper());
@@ -87,44 +97,83 @@ public class ScreenCaptureService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        Log.d(TAG, "🚀 서비스 onStartCommand() 호출됨");
-
         createNotificationChannel();
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("실시간 화면 번역기")
-                .setContentText("화면을 분석하고 있습니다...")
+                .setContentText("원본 텍스트 바로 아래에 콤팩트한 자막을 표시합니다.")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .build();
 
-        // 안드로이드 14(API 34) 이상을 위한 호환성 코드
-        if (android.os.Build.VERSION.SDK_INT >= 34) {
+        if (Build.VERSION.SDK_INT >= 34) {
             startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
         } else {
             startForeground(1, notification);
         }
 
-        // 💡 수정 1: 기본값을 -1이 아닌 0으로 변경합니다.
-        int resultCode = intent.getIntExtra("code", 0);
-
-        // 💡 수정 2: 안드로이드 13 이상을 위한 안전한 데이터 추출 방식 적용
-        Intent resultData;
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            resultData = intent.getParcelableExtra("data", Intent.class);
-        } else {
-            resultData = intent.getParcelableExtra("data");
+        if (intent.hasExtra("targetLang")) {
+            targetLanguage = intent.getStringExtra("targetLang");
         }
+        initTranslator();
 
-        // 💡 수정 3: resultCode가 Activity.RESULT_OK (즉, -1)인지 정확히 확인합니다.
-        if (resultCode == android.app.Activity.RESULT_OK && resultData != null) {
-            Log.d(TAG, "✅ 권한 데이터 수신 완료. 캡처를 시작합니다.");
-            projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData);
-            startScreenCapture();
+        if (mediaProjection == null) {
+            int resultCode = intent.getIntExtra("code", 0);
+            Intent resultData = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ?
+                    intent.getParcelableExtra("data", Intent.class) : intent.getParcelableExtra("data");
+
+            if (resultCode == android.app.Activity.RESULT_OK && resultData != null) {
+                projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                mediaProjection = projectionManager.getMediaProjection(resultCode, resultData);
+
+                setupOverlayContainer();
+                startScreenCapture();
+            }
         } else {
-            Log.e(TAG, "❌ 권한 데이터를 제대로 받지 못했습니다! (수신된 code: " + resultCode + ")");
+            mainHandler.post(() -> {
+                if (overlayContainer != null) overlayContainer.removeAllViews();
+            });
+            activeSubtitles.clear();
         }
 
         return START_NOT_STICKY;
+    }
+
+    private void initTranslator() {
+        TranslatorOptions options = new TranslatorOptions.Builder()
+                .setSourceLanguage(TranslateLanguage.KOREAN)
+                .setTargetLanguage(targetLanguage)
+                .build();
+
+        if (translator != null) translator.close();
+        translator = Translation.getClient(options);
+
+        // [Fix 4] WiFi 조건 제거 → 모바일 데이터에서도 모델 다운로드 가능
+        translator.downloadModelIfNeeded(new DownloadConditions.Builder().build())
+                .addOnSuccessListener(v -> Log.d(TAG, "✅ 번역 모델 준비 완료: " + targetLanguage))
+                .addOnFailureListener(e -> Log.w(TAG, "⚠️ 번역 모델 다운로드 실패: " + e.getMessage()));
+    }
+
+    private void setupOverlayContainer() {
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        overlayContainer = new FrameLayout(this);
+
+        int layoutType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ?
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
+                WindowManager.LayoutParams.TYPE_PHONE;
+
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                layoutType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+        );
+        params.gravity = Gravity.TOP | Gravity.START;
+
+        mainHandler.post(() -> {
+            if (windowManager != null && overlayContainer != null) {
+                windowManager.addView(overlayContainer, params);
+            }
+        });
     }
 
     private void startScreenCapture() {
@@ -133,124 +182,200 @@ public class ScreenCaptureService extends Service {
         int height = metrics.heightPixels;
         int density = metrics.densityDpi;
 
-        // ImageReader 설정: RGBA_8888 포맷으로 최대 2장의 이미지만 보관
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-
         virtualDisplay = mediaProjection.createVirtualDisplay("ScreenCapture",
-                width, height, density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                width, height, density, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 imageReader.getSurface(), null, backgroundHandler);
 
         imageReader.setOnImageAvailableListener(reader -> {
-            Image image = null;
-            try {
-                image = reader.acquireLatestImage();
-                if (image != null) {
-                    long currentTime = System.currentTimeMillis();
-                    // 💡 500ms 간격 + 이전 처리 완료 여부를 함께 확인
-                    if (currentTime - lastAnalyzedTimestamp >= 500
-                            && isProcessing.compareAndSet(false, true)) {
-                        lastAnalyzedTimestamp = currentTime;
-                        processImage(image, width, height);
-                    } else {
-                        image.close(); // 시간 안 지났거나 아직 처리 중이면 버림
-                    }
-                }
-            } catch (Exception e) {
-                if (image != null) image.close();
+            long currentTime = System.currentTimeMillis();
+
+            // [Perf] 인터벌 미달이거나 이미 처리 중이면 프레임 버리기
+            if (currentTime - lastAnalyzedTimestamp < CAPTURE_INTERVAL_MS
+                    || !isProcessing.compareAndSet(false, true)) {
+                Image skip = reader.acquireLatestImage();
+                if (skip != null) skip.close();
+                return;
             }
+            lastAnalyzedTimestamp = currentTime;
+
+            Image image = reader.acquireLatestImage();
+            if (image == null) {
+                isProcessing.set(false);
+                return;
+            }
+            processImage(image, width, height);
         }, backgroundHandler);
     }
 
     private void processImage(Image image, int width, int height) {
-        // ImageReader의 이미지를 Bitmap으로 변환
         Image.Plane[] planes = image.getPlanes();
         ByteBuffer buffer = planes[0].getBuffer();
         int pixelStride = planes[0].getPixelStride();
         int rowStride = planes[0].getRowStride();
         int rowPadding = rowStride - pixelStride * width;
 
-        Bitmap bitmap = Bitmap.createBitmap(width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888);
-        bitmap.copyPixelsFromBuffer(buffer);
-        image.close(); // 이미지는 빨리 닫아줘야 메모리 누수가 없습니다.
+        Bitmap rawBitmap = Bitmap.createBitmap(width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888);
+        rawBitmap.copyPixelsFromBuffer(buffer);
+        image.close();
 
-        // 패딩 잘라내기 (실제 화면 크기에 맞게)
-        Bitmap croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height);
-        InputImage inputImage = InputImage.fromBitmap(croppedBitmap, 0);
+        // [Perf] rowPadding 없으면 추가 복사 생략
+        final Bitmap bitmap;
+        if (rowPadding == 0) {
+            bitmap = rawBitmap;
+        } else {
+            bitmap = Bitmap.createBitmap(rawBitmap, 0, 0, width, height);
+            rawBitmap.recycle();
+        }
+
+        InputImage inputImage = InputImage.fromBitmap(bitmap, 0);
 
         textRecognizer.process(inputImage)
                 .addOnSuccessListener(visionText -> {
-                    // 전체 인식 텍스트를 합쳐서 이전 결과와 비교
-                    StringBuilder sb = new StringBuilder();
-                    for (Text.TextBlock block : visionText.getTextBlocks()) {
-                        sb.append(block.getText().trim()).append("\n");
-                    }
-                    String currentText = sb.toString().trim();
-
-                    if (currentText.isEmpty() || currentText.equals(lastRecognizedText)) {
-                        // 텍스트가 없거나 이전과 동일하면 번역 스킵
-                        Log.d(TAG, "⏭️ 텍스트 변화 없음 — 번역 스킵");
-                        isProcessing.set(false);
-                        return;
-                    }
-
-                    lastRecognizedText = currentText;
-
-                    // 번역할 블록 수를 세어 모든 번역 완료 시 플래그 해제
-                    List<Text.TextBlock> blocks = visionText.getTextBlocks();
-                    AtomicInteger remaining = new AtomicInteger(blocks.size());
-
-                    for (Text.TextBlock block : blocks) {
-                        String text = block.getText();
-                        Rect boundingBox = block.getBoundingBox();
-                        if (boundingBox != null) {
-                            translateText(text, boundingBox, remaining);
-                        } else {
-                            if (remaining.decrementAndGet() == 0) {
-                                isProcessing.set(false);
-                            }
-                        }
-                    }
+                    bitmap.recycle(); // [Perf] OCR 완료 후 즉시 해제
+                    processOcrResult(visionText, width, height);
+                    // [Fix 2] OCR 완료 즉시 잠금 해제 → 번역 대기 중에도 새 프레임 캡처 가능
+                    isProcessing.set(false);
                 })
                 .addOnFailureListener(e -> {
-                    Log.e(TAG, "텍스트 인식 실패", e);
+                    bitmap.recycle();
                     isProcessing.set(false);
+                    Log.e(TAG, "OCR 실패: " + e.getMessage());
                 });
     }
 
-    private void translateText(String text, Rect boundingBox, AtomicInteger remaining) {
-        translator.translate(text)
-                .addOnSuccessListener(translatedText -> {
-                    Log.d(TAG, "✅ [원문] : " + text.replace("\n", " "));
-                    Log.d(TAG, "🎯 [번역] : " + translatedText.replace("\n", " "));
-                    Log.d(TAG, "--------------------------------------------------");
-                    if (remaining.decrementAndGet() == 0) {
-                        isProcessing.set(false);
+    private void processOcrResult(Text visionText, int width, int height) {
+        List<Text.TextBlock> blocks = visionText.getTextBlocks();
+        long currentTime = System.currentTimeMillis();
+
+        // [Fix: 자막 증식] 현재 활성 자막의 화면 점유 영역 스냅샷
+        // OCR이 자막 오버레이 자체를 읽어 새 자막을 생성하는 것을 막음
+        List<Rect> overlayZones = new ArrayList<>(activeSubtitles.size());
+        for (SubtitleItem si : activeSubtitles.values()) {
+            if (si.overlayRect != null) overlayZones.add(si.overlayRect);
+        }
+
+        for (Text.TextBlock block : blocks) {
+            for (Text.Line line : block.getLines()) {
+                String text = line.getText().trim();
+                Rect rect = line.getBoundingBox();
+
+                if (rect == null || text.isEmpty()) continue;
+                if (rect.top < height * 0.08 || rect.bottom > height * 0.95) continue;
+                if (text.length() <= 1) continue;
+                if (!text.matches(".*[가-힣].*")) continue;
+
+                // [Fix: 자막 증식] 감지된 텍스트 영역이 기존 자막 영역과 겹치면 건너뜀
+                boolean inOverlay = false;
+                for (Rect zone : overlayZones) {
+                    if (Rect.intersects(zone, rect)) {
+                        inOverlay = true;
+                        break;
                     }
-                })
-                .addOnFailureListener(e -> {
-                    Log.e(TAG, "번역 실패", e);
-                    if (remaining.decrementAndGet() == 0) {
-                        isProcessing.set(false);
+                }
+                if (inOverlay) continue;
+
+                String key = text.replaceAll("\\s+", "");
+
+                SubtitleItem existing = activeSubtitles.get(key);
+                if (existing != null) {
+                    existing.lastSeenTime = currentTime;
+                    continue;
+                }
+
+                SubtitleItem newItem = new SubtitleItem();
+                newItem.lastSeenTime = currentTime;
+
+                if (activeSubtitles.putIfAbsent(key, newItem) != null) continue;
+
+                final Rect capturedRect = new Rect(rect);
+
+                // [Fix: 자막 겹침] X 범위가 겹치는 기존 자막 아래로 위치 조정
+                int subtitleTop = capturedRect.bottom;
+                for (Rect zone : overlayZones) {
+                    boolean xOverlaps = zone.left < capturedRect.right && zone.right > capturedRect.left;
+                    boolean yConflicts = subtitleTop < zone.bottom && subtitleTop + SUBTITLE_HEIGHT_PX > zone.top;
+                    if (xOverlaps && yConflicts) {
+                        subtitleTop = zone.bottom + 2;
+                    }
+                }
+                final int finalSubtitleTop = subtitleTop;
+
+                // 새 자막 영역을 overlayZones에 추가 → 같은 프레임 내 후속 라인도 인식
+                newItem.overlayRect = new Rect(capturedRect.left, subtitleTop,
+                        capturedRect.right, subtitleTop + SUBTITLE_HEIGHT_PX);
+                overlayZones.add(newItem.overlayRect);
+
+                translator.translate(text)
+                        .addOnSuccessListener(translatedText -> {
+                            mainHandler.post(() -> {
+                                if (overlayContainer == null || activeSubtitles.get(key) != newItem) return;
+
+                                TextView tv = new TextView(ScreenCaptureService.this);
+                                tv.setText(translatedText);
+                                tv.setTextColor(Color.WHITE);
+                                tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+                                tv.setIncludeFontPadding(false);
+                                tv.setBackgroundColor(Color.parseColor("#99000000"));
+                                tv.setPadding(6, 2, 6, 2);
+
+                                FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                                        FrameLayout.LayoutParams.WRAP_CONTENT
+                                );
+                                params.leftMargin = capturedRect.left;
+                                params.topMargin = finalSubtitleTop; // 겹침 방지 후 확정 위치
+
+                                overlayContainer.addView(tv, params);
+                                newItem.view = tv;
+                            });
+                        })
+                        .addOnFailureListener(e -> activeSubtitles.remove(key, newItem));
+            }
+        }
+
+        // 만료 자막 수집 후 일괄 제거
+        List<String> expiredKeys = new ArrayList<>();
+        for (Map.Entry<String, SubtitleItem> entry : activeSubtitles.entrySet()) {
+            if (currentTime - entry.getValue().lastSeenTime > SUBTITLE_EXPIRY_MS) {
+                expiredKeys.add(entry.getKey());
+            }
+        }
+        if (!expiredKeys.isEmpty()) {
+            List<TextView> viewsToRemove = new ArrayList<>(expiredKeys.size());
+            for (String expiredKey : expiredKeys) {
+                SubtitleItem item = activeSubtitles.remove(expiredKey);
+                if (item != null && item.view != null) {
+                    viewsToRemove.add(item.view);
+                    item.view = null;
+                }
+            }
+            if (!viewsToRemove.isEmpty()) {
+                mainHandler.post(() -> {
+                    if (overlayContainer != null) {
+                        for (TextView v : viewsToRemove) overlayContainer.removeView(v);
                     }
                 });
+            }
+        }
     }
 
     private void createNotificationChannel() {
-        // 안드로이드 버전이 8.0(API 26) 이상일 때만 알림 채널을 생성하도록 조건문 추가
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID, "Screen Capture Service", NotificationManager.IMPORTANCE_LOW);
             NotificationManager manager = getSystemService(NotificationManager.class);
-            if (manager != null) {
-                manager.createNotificationChannel(channel);
-            }
+            if (manager != null) manager.createNotificationChannel(channel);
         }
     }
 
     @Override
     public void onDestroy() {
         super.onDestroy();
+        if (overlayContainer != null && windowManager != null) {
+            windowManager.removeView(overlayContainer);
+        }
+        activeSubtitles.clear();
         if (virtualDisplay != null) virtualDisplay.release();
         if (imageReader != null) imageReader.close();
         if (mediaProjection != null) mediaProjection.stop();
