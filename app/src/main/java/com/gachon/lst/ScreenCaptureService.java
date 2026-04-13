@@ -48,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class ScreenCaptureService extends Service {
 
@@ -56,6 +57,7 @@ public class ScreenCaptureService extends Service {
     private static final long CAPTURE_INTERVAL_MS = 500L;   // 1초에 2장
     private static final long SUBTITLE_EXPIRY_MS = 1500L;  // 캡처 간격(500ms)의 3배 → 깜빡임 방지
     private static final int SUBTITLE_HEIGHT_PX = 50;       // 자막 높이 추정값 (충분히 여유있게)
+    private static final int MIN_MATCH_DISTANCE_PX = 32;
 
     private MediaProjectionManager projectionManager;
     private MediaProjection mediaProjection;
@@ -75,10 +77,22 @@ public class ScreenCaptureService extends Service {
     private WindowManager windowManager;
     private FrameLayout overlayContainer;
     private Handler mainHandler;
+    private boolean isProjectionCallbackRegistered = false;
+    private final AtomicLong subtitleIdGenerator = new AtomicLong(0L);
 
     private final ConcurrentHashMap<String, SubtitleItem> activeSubtitles = new ConcurrentHashMap<>();
+    private final MediaProjection.Callback mediaProjectionCallback = new MediaProjection.Callback() {
+        @Override
+        public void onStop() {
+            Log.i(TAG, "MediaProjection stopped by system or user.");
+            teardownCaptureSession();
+            stopSelf();
+        }
+    };
 
     private static class SubtitleItem {
+        String normalizedText;
+        Rect sourceRect;
         TextView view;
         long lastSeenTime;
         Rect overlayRect; // 자막이 화면에서 차지하는 추정 영역 (자막 증식·겹침 방지용)
@@ -123,6 +137,8 @@ public class ScreenCaptureService extends Service {
             if (resultCode == android.app.Activity.RESULT_OK && resultData != null) {
                 projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
                 mediaProjection = projectionManager.getMediaProjection(resultCode, resultData);
+                mediaProjection.registerCallback(mediaProjectionCallback, backgroundHandler);
+                isProjectionCallbackRegistered = true;
 
                 setupOverlayContainer();
                 startScreenCapture();
@@ -208,6 +224,44 @@ public class ScreenCaptureService extends Service {
         }, backgroundHandler);
     }
 
+    private void teardownCaptureSession() {
+        isProcessing.set(false);
+        if (imageReader != null) {
+            imageReader.setOnImageAvailableListener(null, null);
+            imageReader.close();
+            imageReader = null;
+        }
+        if (virtualDisplay != null) {
+            virtualDisplay.release();
+            virtualDisplay = null;
+        }
+        if (mediaProjection != null) {
+            if (isProjectionCallbackRegistered) {
+                mediaProjection.unregisterCallback(mediaProjectionCallback);
+                isProjectionCallbackRegistered = false;
+            }
+            mediaProjection.stop();
+            mediaProjection = null;
+        }
+
+        List<TextView> viewsToRemove = new ArrayList<>();
+        for (SubtitleItem item : activeSubtitles.values()) {
+            if (item.view != null) {
+                viewsToRemove.add(item.view);
+                item.view = null;
+            }
+        }
+        activeSubtitles.clear();
+        mainHandler.post(() -> {
+            if (overlayContainer != null) {
+                for (TextView view : viewsToRemove) {
+                    overlayContainer.removeView(view);
+                }
+                overlayContainer.removeAllViews();
+            }
+        });
+    }
+
     private void processImage(Image image, int width, int height) {
         Image.Plane[] planes = image.getPlanes();
         ByteBuffer buffer = planes[0].getBuffer();
@@ -275,16 +329,20 @@ public class ScreenCaptureService extends Service {
                 }
                 if (inOverlay) continue;
 
-                String key = text.replaceAll("\\s+", "");
-
-                SubtitleItem existing = activeSubtitles.get(key);
+                String normalizedText = normalizeTextKey(text);
+                String existingKey = findMatchingSubtitleKey(normalizedText, rect);
+                SubtitleItem existing = existingKey != null ? activeSubtitles.get(existingKey) : null;
                 if (existing != null) {
                     existing.lastSeenTime = currentTime;
+                    existing.sourceRect = new Rect(rect);
                     continue;
                 }
 
                 SubtitleItem newItem = new SubtitleItem();
+                newItem.normalizedText = normalizedText;
+                newItem.sourceRect = new Rect(rect);
                 newItem.lastSeenTime = currentTime;
+                String key = buildSubtitleKey(normalizedText);
 
                 if (activeSubtitles.putIfAbsent(key, newItem) != null) continue;
 
@@ -360,6 +418,55 @@ public class ScreenCaptureService extends Service {
         }
     }
 
+    private String normalizeTextKey(String text) {
+        return text.replaceAll("\\s+", "");
+    }
+
+    private String buildSubtitleKey(String normalizedText) {
+        return normalizedText + "#" + subtitleIdGenerator.incrementAndGet();
+    }
+
+    private String findMatchingSubtitleKey(String normalizedText, Rect detectedRect) {
+        String bestKey = null;
+        int bestDistance = Integer.MAX_VALUE;
+
+        for (Map.Entry<String, SubtitleItem> entry : activeSubtitles.entrySet()) {
+            SubtitleItem item = entry.getValue();
+            if (item == null || item.sourceRect == null) continue;
+            if (!normalizedText.equals(item.normalizedText)) continue;
+
+            int distance = centerDistance(item.sourceRect, detectedRect);
+            if (!isSameSubtitleRegion(item.sourceRect, detectedRect, distance)) continue;
+
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestKey = entry.getKey();
+            }
+        }
+
+        return bestKey;
+    }
+
+    private boolean isSameSubtitleRegion(Rect existingRect, Rect detectedRect, int centerDistance) {
+        int horizontalTolerance = Math.max(MIN_MATCH_DISTANCE_PX,
+                Math.max(existingRect.width(), detectedRect.width()) / 3);
+        int verticalTolerance = Math.max(MIN_MATCH_DISTANCE_PX + 16,
+                Math.max(existingRect.height(), detectedRect.height()) * 2);
+
+        Rect expanded = new Rect(existingRect);
+        expanded.inset(-horizontalTolerance, -verticalTolerance);
+
+        return Rect.intersects(expanded, detectedRect)
+                || (Math.abs(existingRect.centerX() - detectedRect.centerX()) <= horizontalTolerance
+                && Math.abs(existingRect.centerY() - detectedRect.centerY()) <= verticalTolerance
+                && centerDistance <= horizontalTolerance + verticalTolerance);
+    }
+
+    private int centerDistance(Rect first, Rect second) {
+        return Math.abs(first.centerX() - second.centerX())
+                + Math.abs(first.centerY() - second.centerY());
+    }
+
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
@@ -372,13 +479,16 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        teardownCaptureSession();
         if (overlayContainer != null && windowManager != null) {
-            windowManager.removeView(overlayContainer);
+            try {
+                windowManager.removeView(overlayContainer);
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "Overlay container was already removed.", e);
+            }
         }
-        activeSubtitles.clear();
-        if (virtualDisplay != null) virtualDisplay.release();
-        if (imageReader != null) imageReader.close();
-        if (mediaProjection != null) mediaProjection.stop();
+        overlayContainer = null;
+        windowManager = null;
         if (textRecognizer != null) textRecognizer.close();
         if (translator != null) translator.close();
         if (backgroundThread != null) backgroundThread.quitSafely();
